@@ -1,0 +1,7 @@
+typer[all]>=0.12
+pymongo[srv]>=4.7
+python-dotenv>=1.0
+stanza>=1.8
+deep-translator>=1.11
+rich>=13.7
+requests>=2.31
