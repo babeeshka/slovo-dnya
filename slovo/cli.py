@@ -14,7 +14,8 @@ Commands:
   slovo tr <word>                        Translate Ukrainian word to English
   slovo song search <query>              Search Genius for Ukrainian songs
   slovo song fetch <id>                  Fetch lyrics from Genius and ingest
-  slovo export [--format csv|json]       Export vocabulary to file
+  slovo export [--format csv|json|anki]  Export vocabulary to file
+  slovo study                            Study words with spaced repetition
 """
 from pathlib import Path
 from typing import Optional
@@ -549,11 +550,11 @@ def song_show(
 @app.command()
 def export(
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file path"),
-    fmt: str = typer.Option("csv", "--format", "-f", help="Output format: csv or json"),
+    fmt: str = typer.Option("csv", "--format", "-f", help="Output format: csv, json, or anki"),
     unknown_only: bool = typer.Option(False, "--unknown", "-u", help="Only export unknown words"),
     pos: Optional[str] = typer.Option(None, "--pos", "-p", help="Filter by POS"),
 ):
-    """Export vocabulary to CSV or JSON file."""
+    """Export vocabulary to CSV, JSON, or Anki format file."""
     import csv
     import json
     from slovo.db import words_col
@@ -564,9 +565,15 @@ def export(
     if pos:
         query["pos"] = pos.upper()
 
+    # For Anki, we need example_lines as well
+    if fmt.lower() == "anki":
+        projection = {"_id": 0, "lemma": 1, "pos": 1, "translation": 1, "example_lines": 1}
+    else:
+        projection = {"_id": 0, "lemma": 1, "pos": 1, "frequency": 1, "translation": 1, "known": 1, "notes": 1}
+
     words = list(
         words_col()
-        .find(query, {"_id": 0, "lemma": 1, "pos": 1, "frequency": 1, "translation": 1, "known": 1, "notes": 1})
+        .find(query, projection)
         .sort("frequency", -1)
     )
 
@@ -578,7 +585,8 @@ def export(
     if output is None:
         suffix = "_unknown" if unknown_only else ""
         pos_suffix = f"_{pos.lower()}" if pos else ""
-        output = Path(f"vocabulary{suffix}{pos_suffix}.{fmt}")
+        extension = "txt" if fmt.lower() == "anki" else fmt
+        output = Path(f"vocabulary{suffix}{pos_suffix}.{extension}")
 
     if fmt.lower() == "csv":
         with open(output, "w", newline="", encoding="utf-8") as f:
@@ -596,11 +604,171 @@ def export(
     elif fmt.lower() == "json":
         with open(output, "w", encoding="utf-8") as f:
             json.dump(words, f, ensure_ascii=False, indent=2)
+    elif fmt.lower() == "anki":
+        with open(output, "w", encoding="utf-8") as f:
+            for w in words:
+                lemma = w.get("lemma", "")
+                pos = w.get("pos", "")
+                translation = w.get("translation", "")
+                example_lines = w.get("example_lines", [])
+
+                # Front: Ukrainian word + transliteration
+                translit = transliterate(lemma)
+                front = f"{lemma} ({translit})"
+
+                # Back: translation + POS + example sentence (if available)
+                back_parts = []
+                if translation:
+                    back_parts.append(translation)
+                if pos:
+                    back_parts.append(f"[{pos}]")
+
+                back = " ".join(back_parts)
+
+                # Add example sentence if available
+                if example_lines:
+                    example = example_lines[0].get("cyrillic", "")
+                    if example:
+                        back += f' "{example}"'
+
+                # Write tab-separated line
+                f.write(f"{front}\t{back}\n")
     else:
-        console.print(f"[red]Unknown format:[/red] {fmt}. Use 'csv' or 'json'.")
+        console.print(f"[red]Unknown format:[/red] {fmt}. Use 'csv', 'json', or 'anki'.")
         raise typer.Exit(1)
 
     console.print(f"[green]Exported {len(words)} words to:[/green] {output}")
+
+
+# ── study ─────────────────────────────────────────────────────────────────────
+
+@app.command()
+def study(
+    limit: int = typer.Option(10, "--limit", "-l", help="Number of words to review"),
+    show_stats: bool = typer.Option(True, "--stats/--no-stats", help="Show study statistics before session"),
+):
+    """Study words using spaced repetition (SM-2 algorithm)."""
+    from slovo import study as study_mod
+    from slovo.wod import get_or_translate
+
+    if show_stats:
+        stats = study_mod.get_study_stats()
+        console.print()
+        console.print(Panel(
+            f"[bold]Words due:[/bold] {stats['words_due']}\n"
+            f"[bold]Learning:[/bold] {stats['words_learning']} words\n"
+            f"[bold]Mastered:[/bold] {stats['words_mastered']} words\n"
+            f"[bold]Average ease:[/bold] {stats['average_ease_factor']}\n"
+            f"[bold]Total reviews:[/bold] {stats['total_reviews']}",
+            title="Study Progress",
+            title_align="left",
+            border_style="blue"
+        ))
+        console.print()
+
+    due_words = study_mod.get_due_words(limit=limit)
+
+    if not due_words:
+        console.print("[green]No words due for review![/green]")
+        console.print("[dim]Check back later or lower your --limit to review more words.[/dim]")
+        return
+
+    console.print(f"[bold]Reviewing {len(due_words)} words[/bold]\n")
+
+    completed = 0
+    for word in due_words:
+        lemma = word["lemma"]
+        pos = word.get("pos", "")
+        color = _pos_color(pos)
+        review_count = word.get("review_count", 0)
+
+        # Display word
+        content = Text()
+        content.append(f"  {lemma}\n", style="bold white")
+
+        if review_count == 0:
+            content.append(f"  [dim italic](new word)[/dim italic]\n")
+        else:
+            ease = word.get("ease_factor", 2.5)
+            interval = word.get("interval", 0)
+            content.append(f"  [dim]Reviews: {review_count}  •  Ease: {ease:.2f}  •  Interval: {interval}d[/dim]\n")
+
+        content.append(f"\n  [{pos}]", style=color)
+
+        console.print()
+        console.print(Panel(content, title="Recall this word", title_align="left", border_style="yellow"))
+        console.print()
+
+        # Wait for user to recall
+        input("Press Enter when ready to see the answer...")
+
+        # Show translation and example
+        translation = get_or_translate(word)
+        example_lines = word.get("example_lines", [])
+
+        answer_content = Text()
+        answer_content.append(f"  {lemma}\n", style="bold white")
+        answer_content.append(f"  {translation}\n", style="italic green")
+        answer_content.append(f"\n  [{pos}]", style=color)
+
+        if example_lines:
+            answer_content.append("\n\n")
+            answer_content.append_text(_render_lyric_block(example_lines[0], indent=2))
+
+        console.print(Panel(answer_content, title="Answer", title_align="left", border_style="green"))
+        console.print()
+
+        # Get quality rating
+        console.print("[dim]Rate your recall:[/dim]")
+        console.print("  [red]0[/red] = Complete blackout")
+        console.print("  [yellow]1-2[/yellow] = Incorrect, needed help")
+        console.print("  [blue]3[/blue] = Correct, with difficulty")
+        console.print("  [cyan]4[/cyan] = Correct, with hesitation")
+        console.print("  [green]5[/green] = Perfect, immediate recall")
+
+        while True:
+            try:
+                rating_input = input("\nYour rating (0-5): ").strip()
+                if not rating_input:
+                    console.print("[yellow]Skipping this word...[/yellow]")
+                    break
+
+                quality = int(rating_input)
+                if not 0 <= quality <= 5:
+                    console.print("[red]Please enter a number between 0 and 5[/red]")
+                    continue
+
+                result = study_mod.record_review(lemma, quality)
+                completed += 1
+
+                if quality < 3:
+                    console.print(f"[yellow]Don't worry! You'll see this again soon.[/yellow]")
+                elif quality == 3:
+                    console.print(f"[blue]Next review in {result['interval']} day(s)[/blue]")
+                elif quality == 4:
+                    console.print(f"[cyan]Good! Next review in {result['interval']} day(s)[/cyan]")
+                else:
+                    console.print(f"[green]Excellent! Next review in {result['interval']} day(s)[/green]")
+
+                break
+            except ValueError:
+                console.print("[red]Please enter a valid number[/red]")
+            except Exception as e:
+                console.print(f"[red]Error recording review:[/red] {e}")
+                break
+
+        console.print()
+
+    # Summary
+    console.print()
+    console.print(Panel(
+        f"[bold]Session complete![/bold]\n\n"
+        f"Reviewed: {completed} / {len(due_words)} words",
+        title="Study Summary",
+        title_align="left",
+        border_style="blue"
+    ))
+    console.print()
 
 
 # ── entry ─────────────────────────────────────────────────────────────────────
