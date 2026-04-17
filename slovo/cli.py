@@ -5,14 +5,17 @@ Commands:
   slovo ingest <path>                    Ingest lyrics file(s)
   slovo wod                              Get + deliver today's word
   slovo known <lemma>                    Mark a word as known
-  slovo translate <lemma> <translation>  Set a custom translation
+  slovo set-translation <lemma> <text>   Set a custom translation
   slovo note <lemma> <text>              Attach a personal note
   slovo stats                            Corpus statistics
   slovo history                          Recent WoD history
   slovo list                             Browse corpus by frequency
   slovo lookup <lemma>                   Show full detail for a word
+  slovo tr <word>                        Translate Ukrainian word to English
+  slovo song search <query>              Search Genius for Ukrainian songs
+  slovo song fetch <id>                  Fetch lyrics from Genius and ingest
+  slovo export [--format csv|json]       Export vocabulary to file
 """
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +27,7 @@ from rich.text import Text
 
 from slovo import ingest as ingest_mod
 from slovo import notify, wod as wod_mod
+from slovo.translit import transliterate
 
 app = typer.Typer(
     name="slovo",
@@ -158,10 +162,10 @@ def known(
         console.print(f"[yellow]Not found in corpus:[/yellow] {lemma}")
 
 
-# ── translate ─────────────────────────────────────────────────────────────────
+# ── set-translation ──────────────────────────────────────────────────────────
 
-@app.command()
-def translate(
+@app.command(name="set-translation")
+def set_translation_cmd(
     lemma: str = typer.Argument(..., help="Ukrainian lemma"),
     translation: str = typer.Argument(..., help="Your preferred English translation"),
 ):
@@ -355,6 +359,248 @@ def list_words(
 
     console.print()
     console.print(table)
+
+
+# ── tr (standalone translate) ────────────────────────────────────────────────
+
+@app.command(name="tr")
+def translate_word(
+    word: str = typer.Argument(..., help="Ukrainian word or phrase to translate"),
+    reverse: bool = typer.Option(False, "--reverse", "-r", help="Translate English to Ukrainian"),
+):
+    """Translate a Ukrainian word to English (or reverse with -r)."""
+    from slovo.translation import translate as api_translate
+
+    source = "en" if reverse else "uk"
+    target = "uk" if reverse else "en"
+
+    try:
+        result = api_translate(word, source=source, target=target)
+    except Exception as e:
+        console.print(f"[red]Translation error:[/red] {e}")
+        raise typer.Exit(1)
+
+    # Build output
+    translit = transliterate(word) if not reverse else transliterate(result["translation"])
+    pos = result.get("part_of_speech", "")
+    formality = result.get("formality", "")
+    provider = result.get("provider", "")
+
+    content = Text()
+    content.append(f"  {word}\n", style="bold white")
+    if not reverse:
+        content.append(f"  {translit}\n", style="dim italic")
+    content.append(f"  {result['translation']}\n", style="italic")
+    if reverse:
+        content.append(f"  {translit}\n", style="dim italic")
+
+    meta_parts = []
+    if pos:
+        meta_parts.append(f"[{pos}]")
+    if formality:
+        meta_parts.append(formality)
+    if provider:
+        meta_parts.append(f"via {provider}")
+    if meta_parts:
+        content.append(f"\n  {' · '.join(meta_parts)}\n", style="dim")
+
+    console.print()
+    console.print(Panel(content, title="Translation", title_align="left", border_style="blue"))
+    console.print()
+
+
+# ── song ─────────────────────────────────────────────────────────────────────
+
+song_app = typer.Typer(help="Search and fetch songs from Genius")
+app.add_typer(song_app, name="song")
+
+
+@song_app.command(name="search")
+def song_search(
+    query: str = typer.Argument(..., help="Search query (artist, title, or both)"),
+    limit: int = typer.Option(10, "--limit", "-l", help="Max results to show"),
+):
+    """Search Genius for songs matching query."""
+    from slovo.genius import GeniusService
+
+    try:
+        service = GeniusService()
+    except ValueError as e:
+        console.print(f"[red]Genius API error:[/red] {e}")
+        raise typer.Exit(1)
+
+    try:
+        songs = service.search_songs(query, max_results=limit)
+    except Exception as e:
+        console.print(f"[red]Search failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    if not songs:
+        console.print("[yellow]No songs found.[/yellow]")
+        return
+
+    table = Table(box=None, padding=(0, 2))
+    table.add_column("ID", style="dim")
+    table.add_column("Title", style="bold")
+    table.add_column("Artist")
+    table.add_column("URL", style="dim")
+
+    for song in songs:
+        table.add_row(
+            str(song["id"]),
+            song["title"],
+            song["artist"],
+            song["url"],
+        )
+
+    console.print()
+    console.print(table)
+    console.print()
+    console.print("[dim]Use [bold]slovo song fetch <ID>[/bold] to download lyrics[/dim]")
+
+
+@song_app.command(name="fetch")
+def song_fetch(
+    song_id: int = typer.Argument(..., help="Genius song ID"),
+    save: bool = typer.Option(True, "--save/--no-save", help="Save to lyrics/ directory"),
+    ingest_lyrics: bool = typer.Option(True, "--ingest/--no-ingest", help="Ingest into corpus"),
+):
+    """Fetch lyrics from Genius and optionally ingest into corpus."""
+    from slovo.genius import GeniusService
+
+    try:
+        service = GeniusService()
+    except ValueError as e:
+        console.print(f"[red]Genius API error:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(f"[dim]Fetching song {song_id}...[/dim]")
+
+    try:
+        song = service.get_song(song_id)
+    except Exception as e:
+        console.print(f"[red]Fetch failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(f"[bold]{song['title']}[/bold] by {song['artist']}")
+
+    if not song.get("lyrics"):
+        console.print("[yellow]No lyrics found for this song.[/yellow]")
+        raise typer.Exit(1)
+
+    # Preview first few lines
+    lines = song["lyrics"].split("\n")[:5]
+    console.print()
+    for line in lines:
+        if line.strip():
+            console.print(f"  [dim]{line}[/dim]")
+    if len(song["lyrics"].split("\n")) > 5:
+        console.print("  [dim]...[/dim]")
+    console.print()
+
+    if save:
+        lyrics_dir = Path("lyrics")
+        lyrics_dir.mkdir(exist_ok=True)
+
+        # Sanitize filename
+        safe_artist = "".join(c if c.isalnum() or c in " -_" else "_" for c in song["artist"])
+        safe_title = "".join(c if c.isalnum() or c in " -_" else "_" for c in song["title"])
+        filename = f"{safe_artist} - {safe_title}.txt"
+        filepath = lyrics_dir / filename
+
+        # Write with metadata header
+        content = f"# {song['title']}\n# {song['artist']}\n# Genius ID: {song_id}\n\n{song['lyrics']}"
+        filepath.write_text(content, encoding="utf-8")
+        console.print(f"[green]Saved:[/green] {filepath}")
+
+        if ingest_lyrics:
+            result = ingest_mod.ingest_file(filepath, force=True)
+            new_words = result.get("new_words", 0)
+            updated = result.get("updated_words", 0)
+            console.print(f"[green]Ingested:[/green] +{new_words} new, {updated} updated")
+
+
+@song_app.command(name="show")
+def song_show(
+    song_id: int = typer.Argument(..., help="Genius song ID"),
+):
+    """Show full lyrics for a song without saving."""
+    from slovo.genius import GeniusService
+
+    try:
+        service = GeniusService()
+        song = service.get_song(song_id)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print()
+    console.print(Panel(
+        f"[bold]{song['title']}[/bold]\n{song['artist']}\n{song.get('release_date', '')}",
+        border_style="blue",
+    ))
+    console.print()
+    console.print(song.get("lyrics", "(no lyrics)"))
+    console.print()
+
+
+# ── export ───────────────────────────────────────────────────────────────────
+
+@app.command()
+def export(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output file path"),
+    fmt: str = typer.Option("csv", "--format", "-f", help="Output format: csv or json"),
+    unknown_only: bool = typer.Option(False, "--unknown", "-u", help="Only export unknown words"),
+    pos: Optional[str] = typer.Option(None, "--pos", "-p", help="Filter by POS"),
+):
+    """Export vocabulary to CSV or JSON file."""
+    import csv
+    import json
+    from slovo.db import words_col
+
+    query: dict = {}
+    if unknown_only:
+        query["known"] = False
+    if pos:
+        query["pos"] = pos.upper()
+
+    words = list(
+        words_col()
+        .find(query, {"_id": 0, "lemma": 1, "pos": 1, "frequency": 1, "translation": 1, "known": 1, "notes": 1})
+        .sort("frequency", -1)
+    )
+
+    if not words:
+        console.print("[yellow]No words match that filter.[/yellow]")
+        return
+
+    # Generate filename if not provided
+    if output is None:
+        suffix = "_unknown" if unknown_only else ""
+        pos_suffix = f"_{pos.lower()}" if pos else ""
+        output = Path(f"vocabulary{suffix}{pos_suffix}.{fmt}")
+
+    if fmt.lower() == "csv":
+        with open(output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["lemma", "pos", "frequency", "translation", "known", "notes"])
+            writer.writeheader()
+            for w in words:
+                writer.writerow({
+                    "lemma": w.get("lemma", ""),
+                    "pos": w.get("pos", ""),
+                    "frequency": w.get("frequency", 0),
+                    "translation": w.get("translation", ""),
+                    "known": w.get("known", False),
+                    "notes": w.get("notes", ""),
+                })
+    elif fmt.lower() == "json":
+        with open(output, "w", encoding="utf-8") as f:
+            json.dump(words, f, ensure_ascii=False, indent=2)
+    else:
+        console.print(f"[red]Unknown format:[/red] {fmt}. Use 'csv' or 'json'.")
+        raise typer.Exit(1)
+
+    console.print(f"[green]Exported {len(words)} words to:[/green] {output}")
 
 
 # ── entry ─────────────────────────────────────────────────────────────────────

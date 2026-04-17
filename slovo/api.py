@@ -15,6 +15,10 @@ Endpoints:
     GET  /stats             Corpus statistics
     GET  /history           WoD history
     GET  /songs             List ingested songs
+    POST /translate         Translate Ukrainian text
+    GET  /genius/search     Search Genius for songs
+    GET  /genius/song/{id}  Get song with lyrics from Genius
+    GET  /export            Export vocabulary as JSON
 """
 from datetime import datetime
 from typing import Optional
@@ -22,7 +26,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from slovo.db import history_col, songs_col, words_col
+from slovo.db import songs_col, words_col
 from slovo.wod import (
     get_history,
     get_or_translate,
@@ -117,6 +121,42 @@ class NoteRequest(BaseModel):
 class MessageResponse(BaseModel):
     message: str
     lemma: str
+
+
+class TranslateRequest(BaseModel):
+    text: str
+    source: str = "uk"
+    target: str = "en"
+
+
+class TranslateResponse(BaseModel):
+    translation: str
+    provider: str
+    detected_language: Optional[str] = None
+    part_of_speech: Optional[str] = None
+    formality: Optional[str] = None
+    fallback_reason: Optional[str] = None
+
+
+class GeniusSongResult(BaseModel):
+    id: int
+    title: str
+    artist: str
+    url: str
+
+
+class GeniusSongDetail(BaseModel):
+    id: int
+    title: str
+    artist: str
+    url: str
+    lyrics: str
+    release_date: str
+
+
+class ExportResponse(BaseModel):
+    words: list[dict]
+    count: int
 
 
 # --- Endpoints ---
@@ -271,3 +311,77 @@ def list_songs(
 
     cursor = songs_col().find(query).sort("ingested_at", -1).limit(limit)
     return [SongResponse(**doc) for doc in cursor]
+
+
+# --- Translation endpoints ---
+
+@app.post("/translate", response_model=TranslateResponse)
+def api_translate(body: TranslateRequest):
+    """Translate text using Google Translate API with fallback to deep-translator."""
+    from slovo.translation import translate
+
+    try:
+        result = translate(body.text, source=body.source, target=body.target)
+        return TranslateResponse(**result)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+# --- Genius endpoints ---
+
+@app.get("/genius/search", response_model=list[GeniusSongResult])
+def genius_search(
+    q: str = Query(..., description="Search query"),
+    limit: int = Query(10, ge=1, le=50, description="Max results"),
+):
+    """Search Genius for songs."""
+    from slovo.genius import GeniusService
+
+    try:
+        service = GeniusService()
+        songs = service.search_songs(q, max_results=limit)
+        return [GeniusSongResult(**song) for song in songs]
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Genius API error: {e}")
+
+
+@app.get("/genius/song/{song_id}", response_model=GeniusSongDetail)
+def genius_song(song_id: int):
+    """Get song details and lyrics from Genius."""
+    from slovo.genius import GeniusService
+
+    try:
+        service = GeniusService()
+        song = service.get_song(song_id)
+        return GeniusSongDetail(**song)
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Genius API error: {e}")
+
+
+# --- Export endpoint ---
+
+@app.get("/export", response_model=ExportResponse)
+def api_export(
+    pos: Optional[str] = Query(None, description="Filter by POS"),
+    unknown_only: bool = Query(False, description="Only unknown words"),
+):
+    """Export vocabulary as JSON."""
+    query: dict = {}
+    if pos:
+        query["pos"] = pos.upper()
+    if unknown_only:
+        query["known"] = False
+
+    cursor = (
+        words_col()
+        .find(query, {"_id": 0, "lemma": 1, "pos": 1, "frequency": 1, "translation": 1, "known": 1, "notes": 1})
+        .sort("frequency", -1)
+    )
+    words = list(cursor)
+    return ExportResponse(words=words, count=len(words))

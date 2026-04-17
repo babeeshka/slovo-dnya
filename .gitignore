@@ -58,3 +58,6 @@ stanza_resources/
 
 # Claude
 .claude/
+
+# Local development docs
+docs/
