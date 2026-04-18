@@ -509,8 +509,8 @@ def song_fetch(
         filename = f"{safe_artist} - {safe_title}.txt"
         filepath = lyrics_dir / filename
 
-        # Write with metadata header
-        content = f"# {song['title']}\n# {song['artist']}\n# Genius ID: {song_id}\n\n{song['lyrics']}"
+        # Write with metadata header (format expected by ingest.py)
+        content = f"# Title: {song['title']}\n# Artist: {song['artist']}\n# Genius ID: {song_id}\n\n{song['lyrics']}"
         filepath.write_text(content, encoding="utf-8")
         console.print(f"[green]Saved:[/green] {filepath}")
 
